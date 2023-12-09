@@ -1,7 +1,7 @@
 #[macro_use]
 extern crate serde;
 use candid::{Decode, Encode};
-use ic_cdk::api::time;
+use ic_cdk::api::{time, caller};
 use ic_stable_structures::memory_manager::{MemoryId, MemoryManager, VirtualMemory};
 use ic_stable_structures::{BoundedStorable, Cell, DefaultMemoryImpl, StableBTreeMap, Storable};
 use std::{borrow::Cow, cell::RefCell};
@@ -12,6 +12,7 @@ type IdCell = Cell<u64, Memory>;
 #[derive(candid::CandidType, Clone, Serialize, Deserialize, Default)]
 struct Course {
     id: u64,
+    creator_principal: String,
     title: String,
     description: String,
     lessons: Vec<u64>, // Change lessons type to store lesson IDs
@@ -22,11 +23,14 @@ struct Course {
 #[derive(candid::CandidType, Clone, Serialize, Deserialize, Default)]
 struct Lesson {
     id: u64,
+    course_id: u64,
     title: String,
     content: String,
     created_at: u64,
     updated_at: Option<u64>,
 }
+
+
 
 #[derive(candid::CandidType, Clone, Serialize, Deserialize, Default)]
 struct Certificate {
@@ -105,6 +109,19 @@ impl BoundedStorable for User {
     const IS_FIXED_SIZE: bool = false;
 }
 
+
+#[derive(candid::CandidType, Clone, Serialize, Deserialize, Default)]
+struct LessonPayload {
+    title: String,
+    content: String,
+}
+
+#[derive(candid::CandidType, Clone, Serialize, Deserialize, Default)]
+struct CoursePayload {
+    title: String,
+    description: String,
+}
+
 // Storage for new structs
 
 thread_local! {
@@ -150,8 +167,16 @@ fn get_course(id: u64) -> Result<Course, Error> {
     }
 }
 
+fn is_course_creator(course: &Course) -> Result<(), Error> {
+    if course.creator_principal != caller().to_string(){
+        return Err(Error::NotCreator)
+    }else{
+        Ok(())
+    }
+}
+
 #[ic_cdk::update]
-fn add_course(course: Course) -> Option<Course> {
+fn add_course(course: CoursePayload) -> Option<Course> {
     let id = ID_COUNTER
         .with(|counter| {
             let current_value = *counter.borrow().get();
@@ -160,6 +185,7 @@ fn add_course(course: Course) -> Option<Course> {
         .expect("cannot increment id counter");
     let course = Course {
         id,
+        creator_principal: caller().to_string(),
         title: course.title,
         description: course.description,
         lessons: Vec::new(),
@@ -171,16 +197,19 @@ fn add_course(course: Course) -> Option<Course> {
 }
 
 #[ic_cdk::update]
-fn update_course(id: u64, new_title: String, new_description: String) -> Result<Course, Error> {
+fn update_course(id: u64, payload: CoursePayload) -> Result<Course, Error> {
     let course = _get_course(&id).ok_or_else(|| Error::NotFound {
         msg: format!("course with id={} not found", id),
     })?;
 
+    is_course_creator(&course)?;
+
     // Create an updated course with the new information
     let updated_course = Course {
         id: course.id,
-        title: new_title,
-        description: new_description,
+        creator_principal: course.creator_principal,
+        title: payload.title,
+        description: payload.description,
         lessons: course.lessons.clone(),
         created_at: course.created_at,
         updated_at: Some(time()),
@@ -198,15 +227,19 @@ fn update_course(id: u64, new_title: String, new_description: String) -> Result<
 
 #[ic_cdk::update]
 fn delete_course(id: u64) -> Result<(), Error> {
-    let _course = _get_course(&id).ok_or_else(|| Error::NotFound {
+    let mut _course = _get_course(&id).ok_or_else(|| Error::NotFound {
         msg: format!("course with id={} not found", id),
     })?;
 
+    is_course_creator(&_course)?;
+
+     // Optionally, you may want to delete associated lessons, certificates, or user enrollments
+    _course.lessons.iter_mut().for_each(|lesson_id| {
+        delete_lesson(lesson_id.clone());
+    });
+
     // Delete the course
     COURSE_STORAGE.with(|service| service.borrow_mut().remove(&id));
-
-    // Optionally, you may want to delete associated lessons, certificates, or user enrollments
-
     Ok(())
 }
 
@@ -221,10 +254,13 @@ fn get_lesson(id: u64) -> Result<Lesson, Error> {
 }
 
 #[ic_cdk::update]
-fn add_lesson(lesson: Lesson, course_id: u64) -> Result<(), Error> {
+fn add_lesson(lesson: LessonPayload, course_id: u64) -> Result<(), Error> {
     let course = _get_course(&course_id).ok_or_else(|| Error::NotFound {
         msg: format!("course with id={} not found", course_id),
     })?;
+
+    is_course_creator(&course)?;
+
     let id = ID_COUNTER
         .with(|counter| {
             let current_value = *counter.borrow().get();
@@ -233,6 +269,7 @@ fn add_lesson(lesson: Lesson, course_id: u64) -> Result<(), Error> {
         .expect("cannot increment id counter");
     let new_lesson = Lesson {
         id,
+        course_id,
         title: lesson.title,
         content: lesson.content,
         created_at: time(),
@@ -243,6 +280,7 @@ fn add_lesson(lesson: Lesson, course_id: u64) -> Result<(), Error> {
     // Create an updated course with the new lesson
     let updated_course = Course {
         id: course.id,
+        creator_principal: course.creator_principal,
         title: course.title.clone(),
         description: course.description.clone(),
         lessons: {
@@ -265,16 +303,23 @@ fn add_lesson(lesson: Lesson, course_id: u64) -> Result<(), Error> {
 }
 
 #[ic_cdk::update]
-fn update_lesson(id: u64, new_title: String, new_content: String) -> Result<Lesson, Error> {
+fn update_lesson(id: u64, payload: LessonPayload) -> Result<Lesson, Error> {
     let lesson = _get_lesson(&id).ok_or_else(|| Error::NotFound {
         msg: format!("lesson with id={} not found", id),
     })?;
 
+    let course = _get_course(&lesson.course_id).ok_or_else(|| Error::NotFound {
+        msg: format!("course with id={} not found", lesson.course_id),
+    })?;
+
+    is_course_creator(&course)?;
+
     // Create an updated lesson with the new information
     let updated_lesson = Lesson {
         id: lesson.id,
-        title: new_title,
-        content: new_content,
+        course_id: lesson.course_id,
+        title: payload.title,
+        content: payload.content,
         created_at: lesson.created_at,
         updated_at: Some(time()),
     };
@@ -295,8 +340,34 @@ fn delete_lesson(id: u64) -> Result<(), Error> {
         msg: format!("lesson with id={} not found", id),
     })?;
 
+    let course = _get_course(&_lesson.course_id).ok_or_else(|| Error::NotFound {
+        msg: format!("course with id={} not found", _lesson.course_id),
+    })?;
+
+    is_course_creator(&course.clone())?;
+
+    let updated_course_lesson: Vec<u64> = course.lessons.into_iter().filter(|&lesson_id| lesson_id != id).collect();
+   
+   let updated_course = Course {
+    id: course.id,
+    creator_principal: course.creator_principal,
+    title: course.title,
+    description: course.description,
+    lessons: updated_course_lesson,
+    created_at: course.created_at,
+    updated_at: Some(time()),
+   };
+
+
     // Delete the lesson
     LESSON_STORAGE.with(|service| service.borrow_mut().remove(&id));
+
+    // Replace the existing course with the updated version
+    COURSE_STORAGE.with(|service| {
+        service
+            .borrow_mut()
+            .insert(course.id, updated_course.clone());
+    });
 
     // Optionally, you may want to update associated courses or user progress
 
@@ -320,7 +391,7 @@ fn issue_certificate(user_id: u64, course_id: u64) -> Result<Certificate, Error>
         msg: format!("course with id={} not found", course_id),
     })?;
     // Add more conditions for certification criteria...
-
+    is_course_creator(&_course)?;
     let certificate = Certificate {
         id: ID_COUNTER
             .with(|counter| {
@@ -410,6 +481,8 @@ fn _get_user(id: &u64) -> Option<User> {
 #[derive(candid::CandidType, Deserialize, Serialize)]
 enum Error {
     NotFound { msg: String },
+    NotCreator,
+    InputValidationFailed {msg: String}
 }
 
 // need this to generate candid
