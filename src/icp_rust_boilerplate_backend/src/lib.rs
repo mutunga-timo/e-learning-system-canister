@@ -235,7 +235,7 @@ fn delete_course(id: u64) -> Result<(), Error> {
 
      // Optionally, you may want to delete associated lessons, certificates, or user enrollments
     _course.lessons.iter_mut().for_each(|lesson_id| {
-        delete_lesson(lesson_id.clone());
+        let _ = delete_lesson(lesson_id.clone());
     });
 
     // Delete the course
